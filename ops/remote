@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+
+load_env_file() {
+  local candidate
+  local -a candidates=()
+
+  if [[ -n "${REMOTE_ENV_FILE:-}" ]]; then
+    candidates+=("${REMOTE_ENV_FILE}")
+  fi
+  candidates+=("${REPO_ROOT}/ops/remote.env" "${REPO_ROOT}/.remote.env")
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "${candidate}" ]]; then
+      # shellcheck disable=SC1090
+      source "${candidate}"
+      break
+    fi
+  done
+}
+
+load_env_file
+
+SSH_BIN="${REMOTE_SSH_BIN:-ssh}"
+RSYNC_BIN="${REMOTE_RSYNC_BIN:-rsync}"
+SSH_RETRIES="${REMOTE_SSH_RETRIES:-2}"
+SSH_RETRY_DELAY="${REMOTE_SSH_RETRY_DELAY:-2}"
+RSYNC_RETRIES="${REMOTE_RSYNC_RETRIES:-2}"
+RSYNC_RETRY_DELAY="${REMOTE_RSYNC_RETRY_DELAY:-2}"
+
+default_ssh_options() {
+  printf '%s\n' \
+    "-o" "ControlMaster=auto" \
+    "-o" "ControlPersist=10m" \
+    "-o" "ControlPath=${HOME}/.ssh/cm-%r@%h:%p"
+}
+
+build_ssh_args() {
+  local -a args=()
+  if [[ -n "${REMOTE_SSH_OPTS:-}" ]]; then
+    # shellcheck disable=SC2206
+    args=(${REMOTE_SSH_OPTS})
+  else
+    while IFS= read -r line; do
+      args+=("${line}")
+    done < <(default_ssh_options)
+  fi
+  printf '%s\0' "${args[@]}"
+}
+
+declare -a SSH_ARGS=()
+while IFS= read -r -d '' arg; do
+  SSH_ARGS+=("${arg}")
+done < <(build_ssh_args)
+
+usage() {
+  cat <<'EOF'
+Usage: ops/remote <command>
+
+Commands:
+  sync                Incrementally sync local code to remote via rsync.
+  test quick          Run remote quick test command with structured output.
+  test full           Run remote full test command with structured output.
+  run <cmd>           Run an ad-hoc remote command (optional whitelist).
+  logs <run_id>       Fetch remote run log by run id.
+  cycle               Run sync, then test quick.
+  --help, -h          Show this help text.
+EOF
+}
+
+phase() {
+  echo "[PHASE] $*"
+}
+
+cmd_log() {
+  echo "[CMD] $*"
+}
+
+result_log() {
+  echo "[RESULT] $*"
+}
+
+duration_log() {
+  echo "[DURATION] $*"
+}
+
+run_id_log() {
+  echo "[RUN_ID] $*"
+}
+
+now_epoch() {
+  date +%s
+}
+
+escape_single_quotes() {
+  printf "%s" "$1" | sed "s/'/'\"'\"'/g"
+}
+
+remote_target() {
+  if [[ -n "${REMOTE_USER:-}" ]]; then
+    printf "%s@%s" "${REMOTE_USER}" "${REMOTE_HOST}"
+  else
+    printf "%s" "${REMOTE_HOST}"
+  fi
+}
+
+ensure_positive_integer() {
+  local value="$1"
+  local fallback="$2"
+  if [[ "${value}" =~ ^[0-9]+$ ]] && (( value > 0 )); then
+    printf "%s" "${value}"
+  else
+    printf "%s" "${fallback}"
+  fi
+}
+
+run_with_retries() {
+  local retries
+  retries="$(ensure_positive_integer "${1}" "1")"
+  shift
+  local delay
+  delay="$(ensure_positive_integer "${1}" "1")"
+  shift
+
+  local attempt=1
+  local rc=0
+  local had_errexit=0
+  if [[ $- == *e* ]]; then
+    had_errexit=1
+  fi
+
+  while true; do
+    set +e
+    "$@"
+    rc=$?
+    if (( had_errexit == 1 )); then
+      set -e
+    fi
+    if (( rc == 0 )); then
+      return 0
+    fi
+    if (( attempt >= retries )); then
+      return "${rc}"
+    fi
+    phase "Retry ${attempt}/${retries} after exit ${rc}"
+    sleep "${delay}"
+    attempt=$((attempt + 1))
+  done
+}
+
+ssh_exec_raw() {
+  local remote_command="$1"
+  local quiet="${2:-0}"
+  local target
+  target="$(remote_target)"
+  local -a call=("${SSH_BIN}" "${SSH_ARGS[@]}" "${target}" "${remote_command}")
+
+  if [[ "${quiet}" != "1" ]]; then
+    cmd_log "$(printf "%q " "${call[@]}")"
+  fi
+
+  run_with_retries "${SSH_RETRIES}" "${SSH_RETRY_DELAY}" "${call[@]}"
+}
+
+ssh_exec_bash() {
+  local script="$1"
+  local quiet="${2:-0}"
+  local escaped
+  escaped="$(escape_single_quotes "${script}")"
+  ssh_exec_raw "bash -lc '${escaped}'" "${quiet}"
+}
+
+ssh_transport_for_rsync() {
+  local joined=""
+  local part
+  for part in "${SSH_BIN}" "${SSH_ARGS[@]}"; do
+    if [[ -n "${joined}" ]]; then
+      joined+=" "
+    fi
+    joined+="$(printf "%q" "${part}")"
+  done
+  printf "%s" "${joined}"
+}
+
+require_remote_config() {
+  if [[ -z "${REMOTE_HOST:-}" ]]; then
+    echo "REMOTE_HOST is required (use ops/remote.env)." >&2
+    exit 2
+  fi
+  if [[ -z "${REMOTE_PROJECT_DIR:-}" ]]; then
+    echo "REMOTE_PROJECT_DIR is required (use ops/remote.env)." >&2
+    exit 2
+  fi
+}
+
+finish_with_result() {
+  local rc="$1"
+  local started_at="$2"
+  local elapsed=$(( $(now_epoch) - started_at ))
+  if (( rc == 0 )); then
+    result_log "PASS"
+  else
+    result_log "FAIL"
+  fi
+  duration_log "${elapsed}s"
+  return "${rc}"
+}
+
+ensure_remote_clean_for_sync() {
+  local started_at="$1"
+  local require_clean="${REMOTE_SYNC_REQUIRE_CLEAN_GIT:-1}"
+  if [[ "${require_clean}" != "1" ]]; then
+    return 0
+  fi
+
+  phase "Checking remote git worktree safety"
+  local status_script
+  status_script="$(cat <<EOF
+if git -C '${REMOTE_PROJECT_DIR}' rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C '${REMOTE_PROJECT_DIR}' status --porcelain --untracked-files=no
+fi
+EOF
+)"
+
+  local status_output
+  if ! status_output="$(ssh_exec_bash "${status_script}" "1")"; then
+    echo "Could not inspect remote git status for ${REMOTE_PROJECT_DIR}" >&2
+    return 9
+  fi
+
+  if [[ -n "${status_output//[[:space:]]/}" ]]; then
+    echo "Remote worktree is dirty; refusing sync with --delete."
+    echo "${status_output}"
+    return 3
+  fi
+
+  phase "Remote git worktree is clean"
+  return 0
+}
+
+ensure_remote_directory() {
+  local remote_dir="$1"
+  phase "Ensuring remote directory exists: ${remote_dir}"
+  ssh_exec_bash "mkdir -p '${remote_dir}'"
+}
+
+sync_command() {
+  require_remote_config
+  local started_at
+  started_at="$(now_epoch)"
+  local rc=0
+
+  phase "Starting sync"
+  set +e
+  ensure_remote_clean_for_sync "${started_at}"
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    finish_with_result "${rc}" "${started_at}"
+    return "${rc}"
+  fi
+
+  set +e
+  ensure_remote_directory "${REMOTE_PROJECT_DIR}"
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    finish_with_result "${rc}" "${started_at}"
+    return "${rc}"
+  fi
+
+  local local_source="${REMOTE_LOCAL_SOURCE_DIR:-${REPO_ROOT}}"
+  local exclude_file="${REMOTE_RSYNC_EXCLUDE_FILE:-${REPO_ROOT}/.rsyncignore}"
+  local -a rsync_args=(-az --human-readable --itemize-changes)
+  local rsync_delete="${REMOTE_RSYNC_DELETE:-1}"
+
+  if [[ "${rsync_delete}" == "1" ]]; then
+    rsync_args+=(--delete)
+  fi
+  if [[ -f "${exclude_file}" ]]; then
+    rsync_args+=(--exclude-from="${exclude_file}")
+  fi
+  if [[ -n "${REMOTE_RSYNC_EXTRA_ARGS:-}" ]]; then
+    # shellcheck disable=SC2206
+    local extra_args=(${REMOTE_RSYNC_EXTRA_ARGS})
+    rsync_args+=("${extra_args[@]}")
+  fi
+
+  rsync_args+=(-e "$(ssh_transport_for_rsync)")
+  rsync_args+=("${local_source%/}/" "$(remote_target):${REMOTE_PROJECT_DIR%/}/")
+
+  cmd_log "$(printf "%q " "${RSYNC_BIN}" "${rsync_args[@]}")"
+  set +e
+  run_with_retries "${RSYNC_RETRIES}" "${RSYNC_RETRY_DELAY}" "${RSYNC_BIN}" "${rsync_args[@]}"
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    finish_with_result "${rc}" "${started_at}"
+    return "${rc}"
+  fi
+
+  phase "rsync completed"
+  finish_with_result 0 "${started_at}"
+}
+
+make_run_id() {
+  local mode="$1"
+  printf "%s-%s-%04d" "${mode}" "$(date +%Y%m%d-%H%M%S)" "$((RANDOM % 10000))"
+}
+
+build_direct_test_script() {
+  local remote_cmd="$1"
+  local remote_log_file="$2"
+  cat <<EOF
+set -o pipefail
+cd '${REMOTE_PROJECT_DIR}'
+{ ${remote_cmd}; } 2>&1 | tee '${remote_log_file}'
+status=\${PIPESTATUS[0]}
+printf '%s\n' "\${status}" > '${remote_log_file}.exit'
+exit "\${status}"
+EOF
+}
+
+build_tmux_test_script() {
+  local remote_cmd="$1"
+  local remote_log_file="$2"
+  local run_id="$3"
+  local session="codex-${run_id//[^a-zA-Z0-9]/-}"
+  local runner_file="${remote_log_file}.runner.sh"
+
+  cat <<EOF
+set -euo pipefail
+if ! command -v tmux >/dev/null 2>&1; then
+$(build_direct_test_script "${remote_cmd}" "${remote_log_file}")
+fi
+cat > '${runner_file}' <<'INNER_EOF'
+#!/usr/bin/env bash
+set -o pipefail
+cd '${REMOTE_PROJECT_DIR}'
+{ ${remote_cmd}; } 2>&1 | tee '${remote_log_file}'
+status=\${PIPESTATUS[0]}
+printf '%s\n' "\${status}" > '${remote_log_file}.exit'
+exit "\${status}"
+INNER_EOF
+chmod +x '${runner_file}'
+tmux new-session -d -s '${session}' '${runner_file}'
+while [ ! -f '${remote_log_file}.exit' ]; do
+  sleep 1
+done
+cat '${remote_log_file}'
+status="\$(cat '${remote_log_file}.exit')"
+tmux kill-session -t '${session}' >/dev/null 2>&1 || true
+rm -f '${runner_file}'
+exit "\${status}"
+EOF
+}
+
+test_command() {
+  require_remote_config
+  local mode="$1"
+  local started_at
+  started_at="$(now_epoch)"
+
+  local remote_cmd=""
+  if [[ "${mode}" == "quick" ]]; then
+    remote_cmd="${REMOTE_TEST_QUICK_CMD:-}"
+  elif [[ "${mode}" == "full" ]]; then
+    remote_cmd="${REMOTE_TEST_FULL_CMD:-}"
+  fi
+
+  if [[ -z "${remote_cmd}" ]]; then
+    echo "Missing remote test command for mode '${mode}'." >&2
+    finish_with_result 2 "${started_at}"
+    return 2
+  fi
+
+  local run_id
+  run_id="$(make_run_id "${mode}")"
+  local remote_log_dir="${REMOTE_LOG_DIR:-${REMOTE_PROJECT_DIR%/}/.codex-remote-logs}"
+  local remote_log_file="${remote_log_dir}/${run_id}.log"
+  local rc=0
+
+  phase "Preparing remote test log path"
+  set +e
+  ensure_remote_directory "${remote_log_dir}"
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    finish_with_result "${rc}" "${started_at}"
+    return "${rc}"
+  fi
+
+  phase "Running remote ${mode} test command"
+  local remote_script=""
+  if [[ "${mode}" == "full" && "${REMOTE_USE_TMUX:-0}" == "1" ]]; then
+    remote_script="$(build_tmux_test_script "${remote_cmd}" "${remote_log_file}" "${run_id}")"
+  else
+    remote_script="$(build_direct_test_script "${remote_cmd}" "${remote_log_file}")"
+  fi
+
+  set +e
+  ssh_exec_bash "${remote_script}"
+  local rc=$?
+  set -e
+
+  run_id_log "${run_id}"
+  finish_with_result "${rc}" "${started_at}"
+}
+
+run_command() {
+  require_remote_config
+  local started_at
+  started_at="$(now_epoch)"
+  if [[ "$#" -lt 1 ]]; then
+    echo "run requires a command string." >&2
+    finish_with_result 2 "${started_at}"
+    return 2
+  fi
+
+  local remote_cmd="$*"
+  local whitelist="${REMOTE_ALLOWED_RUN_REGEX:-}"
+  if [[ -n "${whitelist}" && ! "${remote_cmd}" =~ ${whitelist} ]]; then
+    echo "Command not allowed by REMOTE_ALLOWED_RUN_REGEX: ${remote_cmd}" >&2
+    finish_with_result 4 "${started_at}"
+    return 4
+  fi
+
+  phase "Running remote command"
+  local script
+  script="$(cat <<EOF
+cd '${REMOTE_PROJECT_DIR}'
+${remote_cmd}
+EOF
+)"
+  set +e
+  ssh_exec_bash "${script}"
+  local rc=$?
+  set -e
+  finish_with_result "${rc}" "${started_at}"
+}
+
+logs_command() {
+  require_remote_config
+  local started_at
+  started_at="$(now_epoch)"
+  local run_id="${1:-}"
+  if [[ -z "${run_id}" ]]; then
+    echo "logs requires a run_id." >&2
+    finish_with_result 2 "${started_at}"
+    return 2
+  fi
+
+  local remote_log_dir="${REMOTE_LOG_DIR:-${REMOTE_PROJECT_DIR%/}/.codex-remote-logs}"
+  phase "Fetching remote log for run id ${run_id}"
+  local script
+  script="$(cat <<EOF
+log_file='${remote_log_dir}/${run_id}.log'
+if [ ! -f "\${log_file}" ]; then
+  echo "Run log not found: \${log_file}" >&2
+  exit 5
+fi
+cat "\${log_file}"
+EOF
+)"
+  set +e
+  ssh_exec_bash "${script}"
+  local rc=$?
+  set -e
+  finish_with_result "${rc}" "${started_at}"
+}
+
+cycle_command() {
+  phase "Starting default cycle: sync -> test quick"
+  set +e
+  sync_command
+  local sync_rc=$?
+  set -e
+  if (( sync_rc != 0 )); then
+    return "${sync_rc}"
+  fi
+  test_command quick
+}
+
+main() {
+  local command="${1:-}"
+  if [[ -z "${command}" || "${command}" == "--help" || "${command}" == "-h" ]]; then
+    usage
+    exit 0
+  fi
+
+  shift || true
+  case "${command}" in
+    sync)
+      sync_command
+      ;;
+    test)
+      local test_mode="${1:-}"
+      if [[ "${test_mode}" != "quick" && "${test_mode}" != "full" ]]; then
+        echo "Usage: ops/remote test <quick|full>" >&2
+        exit 2
+      fi
+      test_command "${test_mode}"
+      ;;
+    run)
+      run_command "$@"
+      ;;
+    logs)
+      logs_command "${1:-}"
+      ;;
+    cycle)
+      cycle_command
+      ;;
+    *)
+      echo "Unknown command: ${command}" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

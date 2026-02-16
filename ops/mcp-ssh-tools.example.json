@@ -1,0 +1,24 @@
+{
+  "tools": [
+    {
+      "name": "remote_sync",
+      "description": "Sync local repository to remote server using rsync over ssh.",
+      "command": "/Users/kapler/ssh_remote_skill/ops/remote sync"
+    },
+    {
+      "name": "remote_test_quick",
+      "description": "Run quick remote tests and return structured output.",
+      "command": "/Users/kapler/ssh_remote_skill/ops/remote test quick"
+    },
+    {
+      "name": "remote_test_full",
+      "description": "Run full remote tests and return structured output.",
+      "command": "/Users/kapler/ssh_remote_skill/ops/remote test full"
+    },
+    {
+      "name": "remote_logs",
+      "description": "Fetch logs by run id.",
+      "command": "/Users/kapler/ssh_remote_skill/ops/remote logs {{run_id}}"
+    }
+  ]
+}

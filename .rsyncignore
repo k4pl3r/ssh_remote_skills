@@ -1,0 +1,30 @@
+# VCS
+.git/
+
+# Local secrets/config
+ops/remote.env
+.remote.env
+
+# Python
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/*.pyc
+
+# Node
+**/node_modules/
+**/.next/
+**/dist/
+**/build/
+
+# Large model/weights/artifacts
+models/
+weights/
+checkpoints/
+artifacts/
+**/*.pt
+**/*.pth
+**/*.bin
+**/*.safetensors
