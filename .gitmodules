@@ -1,0 +1,6 @@
+[submodule "libs/libs/ssh-mcp-server"]
+	path = libs/libs/ssh-mcp-server
+	url = https://github.com/classfang/ssh-mcp-server.git
+[submodule "libs/ssh-mcp-server"]
+	path = libs/ssh-mcp-server
+	url = https://github.com/classfang/ssh-mcp-server.git
