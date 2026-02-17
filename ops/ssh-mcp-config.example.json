@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "ssh-mcp-server": {
+      "command": "node",
+      "args": [
+        "/Users/kapler/ssh_remote_skill/libs/ssh-mcp-server/build/index.js",
+        "--config-file",
+        "/Users/kapler/ssh_remote_skill/ops/ssh-mcp-targets.example.json"
+      ]
+    }
+  }
+}

@@ -68,13 +68,45 @@ The process exit code always matches real command status (`0` pass, non-zero fai
 
 Keep MCP optional and local-only. Do not depend on remote MCP runtime.
 
-Map MCP tools to this CLI, for example:
+### 5.1 Keep Sync on `ops/remote`
 
-- `remote_sync` -> `ops/remote sync`
-- `remote_test_quick` -> `ops/remote test quick`
-- `remote_test_full` -> `ops/remote test full`
-- `remote_logs` -> `ops/remote logs <run_id>`
+Continue to use local sync:
 
-Reference mapping: `ops/mcp-ssh-tools.example.json`
+```bash
+ops/remote sync
+```
 
-This keeps one operational path and avoids duplicated logic.
+### 5.2 Use SSH MCP as the execution window
+
+1. Put the runner env file on remote host:
+
+```bash
+cp /srv/project/ops/remote-mcp-runner.env.example /srv/project/ops/remote-mcp-runner.env
+```
+
+2. Edit `/srv/project/ops/remote-mcp-runner.env` for your project commands.
+
+3. Configure local MCP client with:
+
+- MCP client config template: `ops/ssh-mcp-config.example.json`
+- SSH target config template: `ops/ssh-mcp-targets.example.json`
+
+4. Allow only runner-based commands in whitelist.
+
+### 5.3 Call patterns (from MCP `execute-command`)
+
+```bash
+bash /srv/project/ops/remote-mcp-runner.sh quick
+bash /srv/project/ops/remote-mcp-runner.sh full
+bash /srv/project/ops/remote-mcp-runner.sh run "echo hello"
+cat /srv/project/.codex-remote-logs/<run_id>.log
+```
+
+The runner emits structured markers:
+
+- `[RUN_ID] ...`
+- `[RESULT] PASS|FAIL`
+- `[EXIT_CODE] <n>`
+- `[DURATION] ...`
+
+LLM can parse these markers from command output text.

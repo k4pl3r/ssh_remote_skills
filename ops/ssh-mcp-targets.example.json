@@ -1,0 +1,19 @@
+{
+  "remote-dev": {
+    "host": "192.168.1.10",
+    "port": 22,
+    "username": "coder",
+    "privateKey": "/Users/kapler/.ssh/id_ed25519",
+    "whitelist": [
+      "^bash /srv/project/ops/remote-mcp-runner.sh quick$",
+      "^bash /srv/project/ops/remote-mcp-runner.sh full$",
+      "^bash /srv/project/ops/remote-mcp-runner.sh run .+$",
+      "^cat /srv/project/.codex-remote-logs/[A-Za-z0-9._-]+\\.log$"
+    ],
+    "blacklist": [
+      "^rm(\\s|$)",
+      "^shutdown(\\s|$)",
+      "^reboot(\\s|$)"
+    ]
+  }
+}
