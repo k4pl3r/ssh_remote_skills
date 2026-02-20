@@ -1,5 +1,7 @@
 # Offline Remote Codex Workflow (`ops/remote`)
 
+English | [中文](README_ZH.md)
+
 This repository provides a single local entrypoint for a split setup:
 
 - Laptop: runs Codex/AI, edits lightweight code.
@@ -110,3 +112,15 @@ The runner emits structured markers:
 - `[DURATION] ...`
 
 LLM can parse these markers from command output text.
+
+## 6) Comparison with Pure MCP Approach
+
+| Scenario | `ops/remote` Standard Workflow | SSH MCP Direct Execution |
+|----------|-------------------------------|-------------------------|
+| Bulk code sync | ✅ `rsync` incremental sync | ❌ Must upload files individually |
+| Execution history | ✅ `logs <id>` for historical lookup | ❌ Only real-time output |
+| Long-running tasks | ✅ `tmux` support, disconnect-resume | ❌ Limited by MCP call timeout |
+| One-shot operation | ✅ `cycle` command (sync+test) | ❌ Requires multiple calls |
+| Interactive exploration | ❌ Non-interactive | ✅ Good for AI Q&A |
+
+**Recommendation**: Use `ops/remote cycle` for development iterations, use MCP for AI-assisted debugging.
