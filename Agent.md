@@ -20,10 +20,10 @@
 1. 本地修改代码。
 2. 同步到远端：
    - `ops/remote sync`
-3. 通过 SSH MCP 的 `execute-command` 在远端执行，例如：
-   - 快速检查：`bash /srv/project/ops/remote-mcp-runner.sh quick`
-   - 全量检查：`bash /srv/project/ops/remote-mcp-runner.sh full`
-   - 自定义执行：`bash /srv/project/ops/remote-mcp-runner.sh run "python3 test.py"`
+3. 通过 SSH MCP 的 `execute-command` 在远端执行命令。
+   - 具体执行什么测试命令、运行命令由 Agent 根据任务自行决定。
+   - 不在本文件中硬编码 quick/full 的具体命令模板。
+   - 唯一强约束：所有远端执行命令必须走 SSH MCP，不得绕过。
 4. 解析标准输出标记：
    - `[RESULT] PASS|FAIL`
    - `[EXIT_CODE] <n>`
@@ -36,8 +36,8 @@
    - 继续下一任务或进入交付。
 
 ## 执行策略
-- 默认在每轮改动后执行 `quick`。
-- 里程碑、交付前、合并前执行 `full`。
+- Agent 根据改动范围与任务风险，自主选择合适的远端测试/运行命令。
+- 可以先做小范围验证，再按需要升级到更全面验证。
 - Bug 修复任务只有在远端验证通过后才能宣称完成。
 
 ## 异常处理
